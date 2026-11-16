@@ -458,6 +458,51 @@
           "minLength": 1,
           "maxLength": 64
         },
+        "autoDistEnabled": {
+          "type": "boolean",
+          "description": "Whether daily 12:01 AM Asia/Dhaka automatic random distribution is enabled."
+        },
+        "autoDistMinTotal": {
+          "type": "number",
+          "description": "Minimum combined daily random messages to distribute."
+        },
+        "autoDistMaxTotal": {
+          "type": "number",
+          "description": "Maximum combined daily random messages to distribute."
+        },
+        "autoDistParticipantMode": {
+          "type": "string",
+          "description": "Whether auto-distribution targets all members or a random subset.",
+          "enum": ["all", "subset"],
+          "maxLength": 16
+        },
+        "autoDistLastRunDateDhaka": {
+          "type": "string",
+          "description": "Last YYYY-MM-DD (Asia/Dhaka) date when auto-distribution ran.",
+          "maxLength": 10
+        },
+        "dripEnabled": {
+          "type": "boolean",
+          "description": "Whether 24-hour continuous random drip distribution is enabled."
+        },
+        "dripMinDailyTotal": {
+          "type": "number",
+          "description": "Minimum total daily messages guaranteed by 24h drip (e.g. 15000)."
+        },
+        "dripIntervalMinutes": {
+          "type": "number",
+          "description": "Minutes between each live 1-3 member random drip tick."
+        },
+        "dripLastTickIso": {
+          "type": "string",
+          "description": "ISO timestamp of the latest 24h drip tick.",
+          "maxLength": 40
+        },
+        "dripLastDateDhaka": {
+          "type": "string",
+          "description": "Last YYYY-MM-DD (Asia/Dhaka) date processed by 24h drip.",
+          "maxLength": 10
+        },
         "updatedAt": {
           "type": "string",
           "format": "date-time",

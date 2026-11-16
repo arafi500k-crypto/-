@@ -190,7 +190,11 @@ service cloud.firestore {
         ]) &&
         data.keys().hasOnly([
           'groupId', 'groupCreationDate', 'timezone', 'deduplicationEnabled',
-          'storeMetadataOnly', 'webhookHeaderName', 'updatedAt', 'updatedBy'
+          'storeMetadataOnly', 'webhookHeaderName', 'updatedAt', 'updatedBy',
+          'autoDistEnabled', 'autoDistMinTotal', 'autoDistMaxTotal',
+          'autoDistParticipantMode', 'autoDistLastRunDateDhaka',
+          'dripEnabled', 'dripMinDailyTotal', 'dripIntervalMinutes',
+          'dripLastTickIso', 'dripLastDateDhaka'
         ]) &&
         isValidId(data.groupId) &&
         data.groupId == 'moonlight-gang' &&
@@ -199,6 +203,16 @@ service cloud.firestore {
         data.deduplicationEnabled is bool &&
         data.storeMetadataOnly is bool &&
         data.webhookHeaderName is string && data.webhookHeaderName.size() >= 1 && data.webhookHeaderName.size() <= 64 &&
+        (!('autoDistEnabled' in data) || data.autoDistEnabled is bool) &&
+        (!('autoDistMinTotal' in data) || (data.autoDistMinTotal is number && data.autoDistMinTotal >= 1)) &&
+        (!('autoDistMaxTotal' in data) || (data.autoDistMaxTotal is number && data.autoDistMaxTotal >= 1 && (!('autoDistMinTotal' in data) || data.autoDistMaxTotal >= data.autoDistMinTotal))) &&
+        (!('autoDistParticipantMode' in data) || (data.autoDistParticipantMode is string && data.autoDistParticipantMode in ['all', 'subset'])) &&
+        (!('autoDistLastRunDateDhaka' in data) || (data.autoDistLastRunDateDhaka is string && data.autoDistLastRunDateDhaka.size() <= 10)) &&
+        (!('dripEnabled' in data) || data.dripEnabled is bool) &&
+        (!('dripMinDailyTotal' in data) || (data.dripMinDailyTotal is number && data.dripMinDailyTotal >= 1)) &&
+        (!('dripIntervalMinutes' in data) || (data.dripIntervalMinutes is number && data.dripIntervalMinutes >= 1 && data.dripIntervalMinutes <= 60)) &&
+        (!('dripLastTickIso' in data) || (data.dripLastTickIso is string && data.dripLastTickIso.size() <= 40)) &&
+        (!('dripLastDateDhaka' in data) || (data.dripLastDateDhaka is string && data.dripLastDateDhaka.size() <= 10)) &&
         data.updatedAt is timestamp &&
         data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 128;
     }
@@ -399,7 +413,12 @@ service cloud.firestore {
         incoming().updatedBy == request.auth.uid &&
         incoming().diff(existing()).affectedKeys().hasOnly([
           'groupCreationDate', 'timezone', 'deduplicationEnabled',
-          'storeMetadataOnly', 'webhookHeaderName', 'updatedAt', 'updatedBy'
+          'storeMetadataOnly', 'webhookHeaderName',
+          'autoDistEnabled', 'autoDistMinTotal', 'autoDistMaxTotal',
+          'autoDistParticipantMode', 'autoDistLastRunDateDhaka',
+          'dripEnabled', 'dripMinDailyTotal', 'dripIntervalMinutes',
+          'dripLastTickIso', 'dripLastDateDhaka',
+          'updatedAt', 'updatedBy'
         ]);
       allow delete: if isValidId(groupId) && isAdmin();
     }

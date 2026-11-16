@@ -94,6 +94,16 @@ export interface AdminSettingsRecord {
   deduplicationEnabled: boolean;
   storeMetadataOnly: boolean;
   webhookHeaderName: string;
+  autoDistEnabled?: boolean;
+  autoDistMinTotal?: number;
+  autoDistMaxTotal?: number;
+  autoDistParticipantMode?: 'all' | 'subset';
+  autoDistLastRunDateDhaka?: string;
+  dripEnabled?: boolean;
+  dripMinDailyTotal?: number;
+  dripIntervalMinutes?: number;
+  dripLastTickIso?: string;
+  dripLastDateDhaka?: string;
   updatedAt?: unknown;
   updatedBy: string;
 }

@@ -1,8 +1,10 @@
-import { useMemo, useState, type ChangeEvent, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from 'react';
 import {
+  Activity,
   AlertTriangle,
   Calendar,
   Check,
+  Clock,
   Download,
   KeyRound,
   Pencil,
@@ -22,6 +24,10 @@ import {
   removeMember,
   removeUserLoginRecord,
   resetAnalyticsData,
+  runDailyAutoDistribution,
+  runDripTick,
+  updateAutoDistributionSettings,
+  updateDripSettings,
   updateGroupCreationDate,
   updateIntegrationSettings,
   updateMemberWithMessageTotal,
@@ -166,6 +172,44 @@ export function AdminPanelView({
   const [distSpreadMode, setDistSpreadMode] = useState<DistributionSpreadMode>('single');
   const [distDate, setDistDate] = useState(todayDhaka);
   const [distSeed, setDistSeed] = useState(() => Math.floor(Math.random() * 1_000_000_000) || 1);
+
+  // Daily 12:01 AM Asia/Dhaka Auto-Distribution Schedule state
+  const [autoDistEnabledInput, setAutoDistEnabledInput] = useState(
+    Boolean(adminSettings?.autoDistEnabled)
+  );
+  const [autoDistMinText, setAutoDistMinText] = useState(
+    String(adminSettings?.autoDistMinTotal ?? 20000)
+  );
+  const [autoDistMaxText, setAutoDistMaxText] = useState(
+    String(adminSettings?.autoDistMaxTotal ?? 30000)
+  );
+  const [autoDistModeInput, setAutoDistModeInput] = useState<DistributionParticipantMode>(
+    adminSettings?.autoDistParticipantMode === 'subset' ? 'subset' : 'all'
+  );
+
+  // 24-Hour Continuous Random Drip state
+  const [dripEnabledInput, setDripEnabledInput] = useState(
+    Boolean(adminSettings?.dripEnabled)
+  );
+  const [dripMinDailyText, setDripMinDailyText] = useState(
+    String(adminSettings?.dripMinDailyTotal ?? 15000)
+  );
+  const [dripIntervalText, setDripIntervalText] = useState(
+    String(adminSettings?.dripIntervalMinutes ?? 4)
+  );
+
+  useEffect(() => {
+    if (!adminSettings) return;
+    setAutoDistEnabledInput(Boolean(adminSettings.autoDistEnabled));
+    setAutoDistMinText(String(adminSettings.autoDistMinTotal ?? 20000));
+    setAutoDistMaxText(String(adminSettings.autoDistMaxTotal ?? 30000));
+    setAutoDistModeInput(
+      adminSettings.autoDistParticipantMode === 'subset' ? 'subset' : 'all'
+    );
+    setDripEnabledInput(Boolean(adminSettings.dripEnabled));
+    setDripMinDailyText(String(adminSettings.dripMinDailyTotal ?? 15000));
+    setDripIntervalText(String(adminSettings.dripIntervalMinutes ?? 4));
+  }, [adminSettings]);
 
   // Creation Date state
   const [creationDateInput, setCreationDateInput] = useState(currentCreationDate);
@@ -521,6 +565,138 @@ export function AdminPanelView({
       );
       handleShuffleSplit();
       return `Distributed ${res.inserted.toLocaleString()} messages randomly across ${distActiveRecipients} ${distActiveRecipients === 1 ? 'member' : 'members'}. Rankings and % shares updated automatically.`;
+    });
+  };
+
+  const handleSaveAutoSchedule = async () => {
+    const minVal = Math.floor(Number(autoDistMinText));
+    const maxVal = Math.floor(Number(autoDistMaxText));
+    if (!Number.isFinite(minVal) || minVal < 1) {
+      setFeedback({ type: 'error', text: 'Minimum daily messages must be at least 1.' });
+      return;
+    }
+    if (!Number.isFinite(maxVal) || maxVal < minVal) {
+      setFeedback({
+        type: 'error',
+        text: 'Maximum daily messages must be greater than or equal to minimum.',
+      });
+      return;
+    }
+
+    await runAction(async () => {
+      await updateAutoDistributionSettings({
+        enabled: autoDistEnabledInput,
+        minTotal: minVal,
+        maxTotal: maxVal,
+        participantMode: autoDistModeInput,
+      });
+      return autoDistEnabledInput
+        ? `Saved 12:01 AM (Asia/Dhaka) auto-distribution: ${minVal.toLocaleString()}–${maxVal.toLocaleString()} messages/day across ${autoDistModeInput === 'subset' ? 'a random subset' : 'all added members'}.`
+        : 'Paused daily 12:01 AM auto-distribution schedule.';
+    });
+  };
+
+  const handleRunAutoScheduleNow = async () => {
+    if (members.length === 0) {
+      setFeedback({ type: 'error', text: 'Add at least one member first.' });
+      return;
+    }
+    await runAction(async () => {
+      const minVal = Math.max(1, Math.floor(Number(autoDistMinText) || 20000));
+      const maxVal = Math.max(minVal, Math.floor(Number(autoDistMaxText) || 30000));
+      await updateAutoDistributionSettings({
+        enabled: autoDistEnabledInput,
+        minTotal: minVal,
+        maxTotal: maxVal,
+        participantMode: autoDistModeInput,
+      });
+      const res = await runDailyAutoDistribution({
+        currentGroup: group,
+        members,
+        dailyStats,
+        monthlyStats,
+        integrationProcessedCount: integration?.eventsProcessedCount ?? 0,
+        adminSettings: {
+          groupId: 'moonlight-gang',
+          groupCreationDate: currentCreationDate,
+          timezone: 'Asia/Dhaka',
+          deduplicationEnabled: true,
+          storeMetadataOnly: true,
+          webhookHeaderName: webhookHeaderInput,
+          updatedBy: userEmail,
+          autoDistEnabled: autoDistEnabledInput,
+          autoDistMinTotal: minVal,
+          autoDistMaxTotal: maxVal,
+          autoDistParticipantMode: autoDistModeInput,
+          autoDistLastRunDateDhaka: adminSettings?.autoDistLastRunDateDhaka || '',
+        },
+        forceRunNow: true,
+      });
+      return `Auto-distributed ${res.inserted.toLocaleString()} random messages across members for ${res.dateKey}.`;
+    });
+  };
+
+  const handleSaveDripSettings = async () => {
+    const minVal = Math.floor(Number(dripMinDailyText));
+    const intervalVal = Math.floor(Number(dripIntervalText));
+    if (!Number.isFinite(minVal) || minVal < 1) {
+      setFeedback({ type: 'error', text: 'Minimum daily total must be at least 1.' });
+      return;
+    }
+    if (!Number.isFinite(intervalVal) || intervalVal < 1 || intervalVal > 60) {
+      setFeedback({ type: 'error', text: 'Tick interval must be between 1 and 60 minutes.' });
+      return;
+    }
+
+    await runAction(async () => {
+      await updateDripSettings({
+        enabled: dripEnabledInput,
+        minDailyTotal: minVal,
+        intervalMinutes: intervalVal,
+      });
+      return dripEnabledInput
+        ? `Saved 24-hour continuous drip: 1–3 random members get 20–50 messages every ${intervalVal} min (min ${minVal.toLocaleString()}/day).`
+        : 'Paused 24-hour continuous random drip.';
+    });
+  };
+
+  const handleTickDripNow = async () => {
+    if (members.length === 0) {
+      setFeedback({ type: 'error', text: 'Add at least one member first.' });
+      return;
+    }
+    const minVal = Math.max(1, Math.floor(Number(dripMinDailyText) || 15000));
+    const intervalVal = Math.max(1, Math.min(60, Math.floor(Number(dripIntervalText) || 4)));
+
+    await runAction(async () => {
+      await updateDripSettings({
+        enabled: dripEnabledInput,
+        minDailyTotal: minVal,
+        intervalMinutes: intervalVal,
+      });
+      const res = await runDripTick({
+        currentGroup: group,
+        members,
+        dailyStats,
+        monthlyStats,
+        integrationProcessedCount: integration?.eventsProcessedCount ?? 0,
+        adminSettings: {
+          groupId: 'moonlight-gang',
+          groupCreationDate: currentCreationDate,
+          timezone: 'Asia/Dhaka',
+          deduplicationEnabled: true,
+          storeMetadataOnly: true,
+          webhookHeaderName: webhookHeaderInput,
+          updatedBy: userEmail,
+          dripEnabled: dripEnabledInput,
+          dripMinDailyTotal: minVal,
+          dripIntervalMinutes: intervalVal,
+          dripLastTickIso: adminSettings?.dripLastTickIso || '',
+          dripLastDateDhaka: adminSettings?.dripLastDateDhaka || '',
+        },
+        forceTickNow: true,
+      });
+      return `Added +${res.added.toLocaleString()} messages across ${res.recipients} random ${res.recipients === 1 ? 'member' : 'members'} (20–50 each).`;
     });
   };
 
@@ -964,6 +1140,220 @@ export function AdminPanelView({
             </div>
           </>
         )}
+
+        {/* Daily 12:01 AM Asia/Dhaka Automatic Schedule */}
+        <div className="border-t border-violet-300/10 pt-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4 text-violet-300" />
+                <h3 className="font-display text-base font-semibold text-zinc-100">
+                  Daily 12:01 AM (Asia/Dhaka) Auto-Distribution
+                </h3>
+              </div>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Automatically adds a random total between Min and Max every day at 12:01 AM Bangladesh time (or on your next admin visit if offline at midnight) · Last auto-run:{' '}
+                <span className="font-mono-tabular text-zinc-200">
+                  {adminSettings?.autoDistLastRunDateDhaka || 'Not yet run'}
+                </span>
+              </p>
+            </div>
+
+            <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-[#0B0B11] border border-violet-300/15 self-start sm:self-auto shrink-0">
+              <button
+                type="button"
+                onClick={() => setAutoDistEnabledInput(false)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  !autoDistEnabledInput
+                    ? 'bg-white/[0.12] text-zinc-100'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Off
+              </button>
+              <button
+                type="button"
+                onClick={() => setAutoDistEnabledInput(true)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  autoDistEnabledInput
+                    ? 'bg-violet-600 text-white'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Auto at 12:01 AM
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1" htmlFor="auto-dist-min">
+                Daily Min Total
+              </label>
+              <input
+                id="auto-dist-min"
+                type="number"
+                min={1}
+                step={1}
+                value={autoDistMinText}
+                onChange={(e) => setAutoDistMinText(e.target.value)}
+                className="w-full h-10 px-3 rounded-xl bg-[#0B0B11] border border-violet-300/15 font-mono-tabular text-sm text-zinc-100 focus:outline-none focus:border-violet-400"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1" htmlFor="auto-dist-max">
+                Daily Max Total
+              </label>
+              <input
+                id="auto-dist-max"
+                type="number"
+                min={1}
+                step={1}
+                value={autoDistMaxText}
+                onChange={(e) => setAutoDistMaxText(e.target.value)}
+                className="w-full h-10 px-3 rounded-xl bg-[#0B0B11] border border-violet-300/15 font-mono-tabular text-sm text-zinc-100 focus:outline-none focus:border-violet-400"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1" htmlFor="auto-dist-mode">
+                Auto Participants
+              </label>
+              <select
+                id="auto-dist-mode"
+                value={autoDistModeInput}
+                onChange={(e) => setAutoDistModeInput(e.target.value as DistributionParticipantMode)}
+                className="w-full h-10 px-3 rounded-xl bg-[#0B0B11] border border-violet-300/15 text-sm text-zinc-100 focus:outline-none focus:border-violet-400"
+              >
+                <option value="all">All added members</option>
+                <option value="subset">Random subset of members</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-end gap-2.5">
+            <button
+              type="button"
+              disabled={busy || members.length === 0}
+              onClick={() => void handleRunAutoScheduleNow()}
+              className="min-h-[40px] px-4 py-2 rounded-xl bg-white/[0.06] hover:bg-white/[0.11] disabled:opacity-40 border border-violet-300/15 text-xs font-medium text-zinc-100 whitespace-nowrap shrink-0 transition-colors"
+            >
+              Run Auto-Split Now
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void handleSaveAutoSchedule()}
+              className="min-h-[40px] px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-xs font-medium whitespace-nowrap shrink-0 transition-colors"
+            >
+              Save 12:01 AM Schedule
+            </button>
+          </div>
+        </div>
+
+        {/* 24-Hour Continuous Random Drip (1-3 Members x 20-50 Messages, >=15k/day) */}
+        <div className="border-t border-violet-300/10 pt-5 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <Activity className="w-4 h-4 text-violet-300" />
+                <h3 className="font-display text-base font-semibold text-zinc-100">
+                  24-Hour Continuous Random Drip (1–3 Members × 20–50 Messages)
+                </h3>
+              </div>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Every few minutes around the clock, 1–3 random members receive 20–50 messages each, with automatic pace catch-up so total reaches at least your daily minimum · Today:{' '}
+                <span className="font-mono-tabular text-zinc-200">
+                  {metrics.todayMessages.toLocaleString()} / {Math.max(1, Math.floor(Number(dripMinDailyText) || 15000)).toLocaleString()}
+                </span>
+                {' · '}Last drip:{' '}
+                <span className="font-mono-tabular text-zinc-200">
+                  {adminSettings?.dripLastTickIso
+                    ? formatDhakaDateTime(adminSettings.dripLastTickIso)
+                    : 'Not yet run'}
+                </span>
+              </p>
+            </div>
+
+            <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-[#0B0B11] border border-violet-300/15 self-start sm:self-auto shrink-0">
+              <button
+                type="button"
+                onClick={() => setDripEnabledInput(false)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  !dripEnabledInput
+                    ? 'bg-white/[0.12] text-zinc-100'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                Off
+              </button>
+              <button
+                type="button"
+                onClick={() => setDripEnabledInput(true)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  dripEnabledInput
+                    ? 'bg-violet-600 text-white'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                24h Active
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1" htmlFor="drip-min-daily">
+                Minimum Daily Total (Messages / 24h)
+              </label>
+              <input
+                id="drip-min-daily"
+                type="number"
+                min={1}
+                step={1}
+                value={dripMinDailyText}
+                onChange={(e) => setDripMinDailyText(e.target.value)}
+                className="w-full h-10 px-3 rounded-xl bg-[#0B0B11] border border-violet-300/15 font-mono-tabular text-sm text-zinc-100 focus:outline-none focus:border-violet-400"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-zinc-400 mb-1" htmlFor="drip-interval-min">
+                Tick Interval (Minutes, 1–60)
+              </label>
+              <input
+                id="drip-interval-min"
+                type="number"
+                min={1}
+                max={60}
+                step={1}
+                value={dripIntervalText}
+                onChange={(e) => setDripIntervalText(e.target.value)}
+                className="w-full h-10 px-3 rounded-xl bg-[#0B0B11] border border-violet-300/15 font-mono-tabular text-sm text-zinc-100 focus:outline-none focus:border-violet-400"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-end gap-2.5">
+            <button
+              type="button"
+              disabled={busy || members.length === 0}
+              onClick={() => void handleTickDripNow()}
+              className="min-h-[40px] px-4 py-2 rounded-xl bg-white/[0.06] hover:bg-white/[0.11] disabled:opacity-40 border border-violet-300/15 text-xs font-medium text-zinc-100 whitespace-nowrap shrink-0 transition-colors"
+            >
+              Tick 1–3 Members Now
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void handleSaveDripSettings()}
+              className="min-h-[40px] px-4 py-2 rounded-xl bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white text-xs font-medium whitespace-nowrap shrink-0 transition-colors"
+            >
+              Save 24h Drip
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* 2. Member Management */}

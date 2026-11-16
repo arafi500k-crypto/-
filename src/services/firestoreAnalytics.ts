@@ -4,6 +4,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  increment,
   query,
   serverTimestamp,
   setDoc,
@@ -13,6 +14,7 @@ import {
 } from 'firebase/firestore';
 import { auth, db, FIREBASE_PROJECT_ID, handleFirestoreError, OperationType } from '../lib/firebase';
 import type {
+  AdminSettingsRecord,
   AuthorizedIncomingEvent,
   DailyStatisticRecord,
   GroupRecord,
@@ -21,7 +23,8 @@ import type {
   MessageEventRecord,
   MonthlyStatisticRecord,
 } from '../types/analytics';
-import { getDhakaDateKey, getDhakaMonthKey } from '../utils/dhakaTime';
+import { dhakaDateAndTimeToIso, getDhakaDateKey, getDhakaMonthKey } from '../utils/dhakaTime';
+import { computeRandomMemberAllocations } from '../utils/randomDistribution';
 import {
   GROUP_ID,
   GROUP_NAME,
@@ -1069,3 +1072,513 @@ export async function resetAnalyticsData(keepMembers: boolean): Promise<void> {
     handleFirestoreError(error, OperationType.DELETE, `groups/${GROUP_ID}`);
   }
 }
+
+export function getDhakaMinutesOfDay(date: Date = new Date()): number {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Asia/Dhaka',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value ?? '0');
+  const minute = Number(parts.find((p) => p.type === 'minute')?.value ?? '0');
+  return (hour % 24) * 60 + minute;
+}
+
+export async function updateAutoDistributionSettings(params: {
+  enabled: boolean;
+  minTotal: number;
+  maxTotal: number;
+  participantMode: 'all' | 'subset';
+}): Promise<void> {
+  const uid = requireVerifiedUid();
+  const safeMin = Math.max(1, Math.floor(Number(params.minTotal) || 1));
+  const safeMax = Math.max(safeMin, Math.floor(Number(params.maxTotal) || safeMin));
+  const todayDhaka = getDhakaDateKey();
+
+  await bootstrapWorkspaceIfMissing(todayDhaka);
+
+  try {
+    const settingsRef = doc(db, 'adminSettings', GROUP_ID);
+    const snap = await getDoc(settingsRef);
+    const existingLastRun = String(snap.data()?.autoDistLastRunDateDhaka || '');
+
+    // When enabling, if never scheduled before (or resuming after an older date), anchor to today
+    // so the automatic run fires at 12:01 AM tonight (unless admin clicks Run Now).
+    const nextLastRun =
+      params.enabled && existingLastRun < todayDhaka ? todayDhaka : existingLastRun;
+
+    await updateDoc(settingsRef, {
+      autoDistEnabled: params.enabled,
+      autoDistMinTotal: safeMin,
+      autoDistMaxTotal: safeMax,
+      autoDistParticipantMode: params.participantMode,
+      autoDistLastRunDateDhaka: nextLastRun,
+      updatedAt: serverTimestamp(),
+      updatedBy: uid,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `adminSettings/${GROUP_ID}`);
+  }
+}
+
+export async function runDailyAutoDistribution(params: {
+  currentGroup: GroupRecord | null;
+  members: MemberRecord[];
+  dailyStats: DailyStatisticRecord[];
+  monthlyStats: MonthlyStatisticRecord[];
+  integrationProcessedCount: number;
+  adminSettings: AdminSettingsRecord | null;
+  forceRunNow?: boolean;
+}): Promise<{ ran: boolean; inserted: number; dateKey: string }> {
+  const uid = requireVerifiedUid();
+  const todayDhaka = getDhakaDateKey();
+
+  if (params.members.length === 0) {
+    return { ran: false, inserted: 0, dateKey: todayDhaka };
+  }
+
+  if (!params.forceRunNow) {
+    if (!params.adminSettings?.autoDistEnabled) {
+      return { ran: false, inserted: 0, dateKey: todayDhaka };
+    }
+    // Wait until 00:01 AM Asia/Dhaka
+    if (getDhakaMinutesOfDay() < 1) {
+      return { ran: false, inserted: 0, dateKey: todayDhaka };
+    }
+    if ((params.adminSettings.autoDistLastRunDateDhaka || '') >= todayDhaka) {
+      return { ran: false, inserted: 0, dateKey: todayDhaka };
+    }
+  }
+
+  // Re-read adminSettings fresh from Firestore to prevent concurrent tab/Cloud Function duplicates
+  const settingsRef = doc(db, 'adminSettings', GROUP_ID);
+  let freshSettings: AdminSettingsRecord | null = params.adminSettings;
+  try {
+    const snap = await getDoc(settingsRef);
+    if (snap.exists()) {
+      freshSettings = snap.data() as AdminSettingsRecord;
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, `adminSettings/${GROUP_ID}`);
+  }
+
+  const alreadyRanToday = (freshSettings?.autoDistLastRunDateDhaka || '') >= todayDhaka;
+  if (!params.forceRunNow) {
+    if (!freshSettings?.autoDistEnabled || alreadyRanToday) {
+      return { ran: false, inserted: 0, dateKey: todayDhaka };
+    }
+  }
+
+  const minTotal = Math.max(1, Math.floor(freshSettings?.autoDistMinTotal ?? 20000));
+  const maxTotal = Math.max(minTotal, Math.floor(freshSettings?.autoDistMaxTotal ?? 30000));
+  const participantMode = freshSettings?.autoDistParticipantMode === 'subset' ? 'subset' : 'all';
+
+  const totalToAdd = minTotal + Math.floor(Math.random() * (maxTotal - minTotal + 1));
+  const seed = (Date.now() ^ Math.floor(Math.random() * 1_000_000_000)) >>> 0 || 1;
+
+  const pseudoRanked = params.members.map((m, idx) => ({
+    ...m,
+    messagesToday: 0,
+    messagesThisWeek: 0,
+    messagesThisMonth: 0,
+    messagesLifetime: m.totalMessages,
+    shareTodayPct: 0,
+    shareWeekPct: 0,
+    shareMonthPct: 0,
+    shareLifetimePct: 0,
+    rank: idx + 1,
+  }));
+
+  const allocations = computeRandomMemberAllocations({
+    rankedMembers: pseudoRanked,
+    totalToAdd,
+    participantMode,
+    seed,
+  });
+
+  const targetIso = params.forceRunNow
+    ? new Date().toISOString()
+    : dhakaDateAndTimeToIso(todayDhaka, '00:01');
+  const idPrefix = alreadyRanToday
+    ? `autosc_now_${todayDhaka}_${Date.now().toString(36)}`
+    : `autosc_${todayDhaka}`;
+
+  const events: AuthorizedIncomingEvent[] = allocations
+    .filter((a) => a.addedMessages > 0)
+    .map((a) => ({
+      messageId: sanitizeFirestoreId(`${idPrefix}_${a.memberId}`, 'msg'),
+      senderId: a.memberId,
+      senderDisplayName: a.displayName,
+      timestamp: targetIso,
+      handle: a.handle,
+      avatarUrl: a.avatarUrl,
+      source: 'admin_manual',
+      messageCount: a.addedMessages,
+    }));
+
+  if (events.length === 0) {
+    return { ran: false, inserted: 0, dateKey: todayDhaka };
+  }
+
+  const res = await ingestAuthorizedEvents(
+    events,
+    params.currentGroup,
+    params.members,
+    params.dailyStats,
+    params.monthlyStats,
+    params.integrationProcessedCount
+  );
+
+  try {
+    await updateDoc(settingsRef, {
+      autoDistLastRunDateDhaka: todayDhaka,
+      updatedAt: serverTimestamp(),
+      updatedBy: uid,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `adminSettings/${GROUP_ID}`);
+  }
+
+  return { ran: true, inserted: res.inserted, dateKey: todayDhaka };
+}
+
+export async function updateDripSettings(params: {
+  enabled: boolean;
+  minDailyTotal: number;
+  intervalMinutes: number;
+}): Promise<void> {
+  const uid = requireVerifiedUid();
+  const safeMin = Math.max(1, Math.floor(Number(params.minDailyTotal) || 15000));
+  const safeInterval = Math.max(1, Math.min(60, Math.floor(Number(params.intervalMinutes) || 4)));
+  const todayDhaka = getDhakaDateKey();
+
+  await bootstrapWorkspaceIfMissing(todayDhaka);
+
+  try {
+    await updateDoc(doc(db, 'adminSettings', GROUP_ID), {
+      dripEnabled: params.enabled,
+      dripMinDailyTotal: safeMin,
+      dripIntervalMinutes: safeInterval,
+      updatedAt: serverTimestamp(),
+      updatedBy: uid,
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `adminSettings/${GROUP_ID}`);
+  }
+}
+
+export interface DripTickResult {
+  ticked: boolean;
+  mode: 'disabled' | 'cooldown' | 'no_members' | 'live' | 'catchup';
+  added: number;
+  recipients: number;
+  dateKey: string;
+}
+
+function getDhakaDayStartMs(dateKey: string): number {
+  return new Date(`${dateKey}T00:00:00+06:00`).getTime();
+}
+
+export async function runDripTick(params: {
+  currentGroup: GroupRecord | null;
+  members: MemberRecord[];
+  dailyStats: DailyStatisticRecord[];
+  monthlyStats: MonthlyStatisticRecord[];
+  integrationProcessedCount: number;
+  adminSettings: AdminSettingsRecord | null;
+  forceTickNow?: boolean;
+}): Promise<DripTickResult> {
+  const uid = requireVerifiedUid();
+  const now = new Date();
+  const nowMs = now.getTime();
+  const nowIso = now.toISOString().slice(0, 40);
+  const todayDhaka = getDhakaDateKey(now);
+  const monthKeyDhaka = getDhakaMonthKey(now);
+
+  if (params.members.length === 0) {
+    return { ticked: false, mode: 'no_members', added: 0, recipients: 0, dateKey: todayDhaka };
+  }
+
+  if (!params.forceTickNow && !params.adminSettings?.dripEnabled) {
+    return { ticked: false, mode: 'disabled', added: 0, recipients: 0, dateKey: todayDhaka };
+  }
+
+  const creationDate = params.currentGroup?.creationDate || todayDhaka;
+  await bootstrapWorkspaceIfMissing(creationDate);
+
+  const settingsRef = doc(db, 'adminSettings', GROUP_ID);
+  const dailyRef = doc(db, 'dailyStatistics', todayDhaka);
+  const monthlyRef = doc(db, 'monthlyStatistics', monthKeyDhaka);
+
+  let settingsSnapData: AdminSettingsRecord | null = params.adminSettings;
+  let dailySnapExists = false;
+  let prevDailyTotal = 0;
+  let prevDailyActiveCount = 0;
+  let monthlySnapExists = false;
+  let prevMonthlyTotal = 0;
+  let prevMonthlyActiveDays = 0;
+  let prevMonthlyPeak = 0;
+  let prevMonthlyPeakDate = '';
+
+  try {
+    const [settingsSnap, dailySnap, monthlySnap] = await Promise.all([
+      getDoc(settingsRef),
+      getDoc(dailyRef),
+      getDoc(monthlyRef),
+    ]);
+
+    if (settingsSnap.exists()) {
+      settingsSnapData = settingsSnap.data() as AdminSettingsRecord;
+    }
+    if (dailySnap.exists()) {
+      dailySnapExists = true;
+      prevDailyTotal = Number(dailySnap.data()?.totalMessages || 0);
+      prevDailyActiveCount = Number(dailySnap.data()?.activeMemberCount || 0);
+    }
+    if (monthlySnap.exists()) {
+      monthlySnapExists = true;
+      prevMonthlyTotal = Number(monthlySnap.data()?.totalMessages || 0);
+      prevMonthlyActiveDays = Number(monthlySnap.data()?.activeDays || 0);
+      prevMonthlyPeak = Number(monthlySnap.data()?.peakDailyMessages || 0);
+      prevMonthlyPeakDate = String(monthlySnap.data()?.peakDate || '');
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, `adminSettings/${GROUP_ID}`);
+  }
+
+  const intervalMinutes = Math.max(
+    1,
+    Math.min(60, Math.floor(Number(settingsSnapData?.dripIntervalMinutes) || 4))
+  );
+  const minDailyTotal = Math.max(1, Math.floor(Number(settingsSnapData?.dripMinDailyTotal) || 15000));
+  const lastTickIso = String(settingsSnapData?.dripLastTickIso || '');
+  const lastTickMs = lastTickIso ? Date.parse(lastTickIso) : 0;
+  const lastDateDhaka = String(settingsSnapData?.dripLastDateDhaka || '');
+  const minutesElapsed = getDhakaMinutesOfDay(now);
+
+  if (!params.forceTickNow) {
+    if (!settingsSnapData?.dripEnabled) {
+      return { ticked: false, mode: 'disabled', added: 0, recipients: 0, dateKey: todayDhaka };
+    }
+    const isSameDay = lastDateDhaka === todayDhaka;
+    const endOfDayUrgent = minutesElapsed >= 1385 && prevDailyTotal < minDailyTotal;
+    const minWaitMs = endOfDayUrgent ? 60_000 : intervalMinutes * 60_000;
+
+    if (isSameDay && Number.isFinite(lastTickMs) && lastTickMs > 0 && nowMs - lastTickMs < minWaitMs) {
+      return { ticked: false, mode: 'cooldown', added: 0, recipients: 0, dateKey: todayDhaka };
+    }
+  }
+
+  // Decide live 1-3 members x 20-50 tick vs catch-up to guarantee daily minimum
+  const effectiveDailyTarget = Math.round(minDailyTotal * 1.12);
+  const dayProgress = Math.min(1, (minutesElapsed + 1) / 1440);
+  const expectedByNow = Math.floor(effectiveDailyTarget * dayProgress);
+  const paceDeficit = expectedByNow - prevDailyTotal;
+  const endOfDayDeficit =
+    minutesElapsed >= 1380 && prevDailyTotal < minDailyTotal
+      ? minDailyTotal - prevDailyTotal + 50 + Math.floor(Math.random() * 250)
+      : 0;
+
+  const isCatchup =
+    !params.forceTickNow && (endOfDayDeficit > 0 || paceDeficit > 300);
+
+  const allocations: Array<{
+    member: MemberRecord;
+    count: number;
+    timestamp: string;
+  }> = [];
+
+  if (isCatchup) {
+    const catchupTotal = Math.max(endOfDayDeficit, paceDeficit);
+    const shuffled = [...params.members];
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const maxRecipients = Math.min(shuffled.length, 12, Math.max(1, catchupTotal));
+    const chosen = shuffled.slice(0, maxRecipients);
+
+    const weights = chosen.map(() => 0.35 + Math.random() * 1.65);
+    const weightSum = weights.reduce((s, w) => s + w, 0) || chosen.length;
+    const remaining = Math.max(0, catchupTotal - chosen.length);
+    const exact = weights.map((w) => (remaining * w) / weightSum);
+    const amounts = exact.map((v) => 1 + Math.floor(v));
+    const leftover = catchupTotal - amounts.reduce((s, v) => s + v, 0);
+    const remIdx = exact
+      .map((v, idx) => ({ idx, frac: v - Math.floor(v) }))
+      .sort((a, b) => b.frac - a.frac);
+    for (let i = 0; i < leftover; i += 1) {
+      amounts[remIdx[i % chosen.length].idx] += 1;
+    }
+
+    const dayStartMs = getDhakaDayStartMs(todayDhaka);
+    const gapStartMs =
+      lastDateDhaka === todayDhaka && Number.isFinite(lastTickMs) && lastTickMs > dayStartMs
+        ? lastTickMs
+        : dayStartMs;
+    const spanMs = Math.max(0, nowMs - gapStartMs);
+
+    chosen.forEach((member, idx) => {
+      const frac = chosen.length === 1 ? 1 : (idx + 1) / chosen.length;
+      const evMs = Math.min(nowMs, Math.round(gapStartMs + spanMs * frac));
+      allocations.push({
+        member,
+        count: amounts[idx],
+        timestamp: new Date(evMs).toISOString().slice(0, 40),
+      });
+    });
+  } else {
+    // Normal live tick: pick 1-3 random members, give each 20-50 random messages
+    const shuffled = [...params.members];
+    for (let i = shuffled.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    const pickCount = Math.min(shuffled.length, 1 + Math.floor(Math.random() * 3));
+    const chosen = shuffled.slice(0, pickCount);
+
+    for (const member of chosen) {
+      const count = 20 + Math.floor(Math.random() * 31);
+      allocations.push({
+        member,
+        count,
+        timestamp: nowIso,
+      });
+    }
+  }
+
+  const totalAdded = allocations.reduce((sum, a) => sum + a.count, 0);
+  if (totalAdded <= 0) {
+    return { ticked: false, mode: 'no_members', added: 0, recipients: 0, dateKey: todayDhaka };
+  }
+
+  const nextDailyTotal = prevDailyTotal + totalAdded;
+  const nextDailyActive = Math.max(prevDailyActiveCount, allocations.length);
+  const nextMonthlyTotal = prevMonthlyTotal + totalAdded;
+  const nextMonthlyActiveDays =
+    prevMonthlyActiveDays + (prevDailyTotal === 0 ? 1 : 0);
+  const nextMonthlyPeak =
+    nextDailyTotal > prevMonthlyPeak ? nextDailyTotal : prevMonthlyPeak;
+  const nextMonthlyPeakDate =
+    nextDailyTotal > prevMonthlyPeak ? todayDhaka : prevMonthlyPeakDate;
+
+  try {
+    const rollupBatch = writeBatch(db);
+
+    for (const item of allocations) {
+      const mRef = doc(db, 'members', item.member.memberId);
+      const nextMemberLastActive =
+        !item.member.lastActiveAt || item.timestamp >= item.member.lastActiveAt
+          ? item.timestamp
+          : item.member.lastActiveAt;
+      rollupBatch.update(mRef, {
+        totalMessages: increment(item.count),
+        lastActiveAt: nextMemberLastActive,
+        lastActiveDateDhaka: todayDhaka,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (!dailySnapExists) {
+      rollupBatch.set(dailyRef, {
+        dateKey: todayDhaka,
+        groupId: GROUP_ID,
+        monthKey: monthKeyDhaka,
+        totalMessages: nextDailyTotal,
+        activeMemberCount: nextDailyActive,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      rollupBatch.update(dailyRef, {
+        totalMessages: increment(totalAdded),
+        activeMemberCount: nextDailyActive,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (!monthlySnapExists) {
+      rollupBatch.set(monthlyRef, {
+        monthKey: monthKeyDhaka,
+        groupId: GROUP_ID,
+        totalMessages: nextMonthlyTotal,
+        activeDays: 1,
+        peakDailyMessages: nextDailyTotal,
+        peakDate: todayDhaka,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      rollupBatch.update(monthlyRef, {
+        totalMessages: increment(totalAdded),
+        activeDays: nextMonthlyActiveDays,
+        peakDailyMessages: nextMonthlyPeak,
+        peakDate: nextMonthlyPeakDate,
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    if (params.currentGroup && todayDhaka >= creationDate) {
+      const prevHighest = params.currentGroup.highestDailyCount || 0;
+      const prevHighestDate = params.currentGroup.highestDailyDate || '';
+
+      rollupBatch.update(doc(db, 'groups', GROUP_ID), {
+        totalLifetimeMessages: increment(totalAdded),
+        ...(prevDailyTotal === 0 ? { totalActiveDays: increment(1) } : {}),
+        highestDailyCount: nextDailyTotal > prevHighest ? nextDailyTotal : prevHighest,
+        highestDailyDate: nextDailyTotal > prevHighest ? todayDhaka : prevHighestDate,
+        updatedAt: serverTimestamp(),
+        updatedBy: uid,
+      });
+    }
+
+    rollupBatch.update(doc(db, 'integrationStatus', GROUP_ID), {
+      lastEventAt: nowIso,
+      eventsProcessedCount: increment(totalAdded),
+      updatedAt: serverTimestamp(),
+      updatedBy: uid,
+    });
+
+    rollupBatch.update(settingsRef, {
+      dripLastTickIso: nowIso,
+      dripLastDateDhaka: todayDhaka,
+      updatedAt: serverTimestamp(),
+      updatedBy: uid,
+    });
+
+    await rollupBatch.commit();
+
+    const msgBatch = writeBatch(db);
+    const batchStamp = nowMs.toString(36);
+    allocations.forEach((item, idx) => {
+      const msgId = sanitizeFirestoreId(
+        `drip_${todayDhaka}_${batchStamp}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+        'msg'
+      );
+      msgBatch.set(doc(db, 'messageEvents', msgId), {
+        messageId: msgId,
+        groupId: GROUP_ID,
+        senderId: item.member.memberId,
+        senderDisplayName: item.member.displayName,
+        timestamp: item.timestamp,
+        receivedTimestamp: serverTimestamp(),
+        dateKeyDhaka: todayDhaka,
+        monthKeyDhaka: monthKeyDhaka,
+        source: 'admin_manual',
+        createdBy: uid,
+        ...(item.count > 1 ? { messageCount: item.count } : {}),
+      });
+    });
+    await msgBatch.commit();
+
+    return {
+      ticked: true,
+      mode: isCatchup ? 'catchup' : 'live',
+      added: totalAdded,
+      recipients: allocations.length,
+      dateKey: todayDhaka,
+    };
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, 'messageEvents');
+  }
+}
+

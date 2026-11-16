@@ -12,7 +12,12 @@ import { MessageHistoryView } from './components/MessageHistoryView';
 import { SettingsView } from './components/SettingsView';
 import { SidebarNav } from './components/SidebarNav';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from './lib/firebase';
-import { bootstrapWorkspaceIfMissing, recordUserLogin } from './services/firestoreAnalytics';
+import {
+  bootstrapWorkspaceIfMissing,
+  recordUserLogin,
+  runDailyAutoDistribution,
+  runDripTick,
+} from './services/firestoreAnalytics';
 import { GROUP_ID } from './services/integrationAdapter';
 import type {
   AdminSettingsRecord,
@@ -50,6 +55,8 @@ export default function App() {
   const [events, setEvents] = useState<MessageEventRecord[]>([]);
   const [userLogins, setUserLogins] = useState<UserLoginRecord[]>([]);
   const recordedLoginUidRef = useRef<string | null>(null);
+  const autoDistRunningRef = useRef(false);
+  const dripRunningRef = useRef(false);
 
   const isBootstrappedAdmin = Boolean(
     user && user.emailVerified && user.email?.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL
@@ -229,6 +236,64 @@ export default function App() {
       unsubLogins();
     };
   }, [authReady, user, isAdmin]);
+
+  // Automatic daily 12:01 AM Asia/Dhaka random distribution (runs on midnight rollover or next admin visit)
+  useEffect(() => {
+    if (!authReady || !user || !isAdmin) return;
+    if (!adminSettings?.autoDistEnabled || members.length === 0) return;
+
+    const tryRunSchedule = () => {
+      if (autoDistRunningRef.current) return;
+      autoDistRunningRef.current = true;
+      void runDailyAutoDistribution({
+        currentGroup: group,
+        members,
+        dailyStats,
+        monthlyStats,
+        integrationProcessedCount: integration?.eventsProcessedCount ?? 0,
+        adminSettings,
+      })
+        .catch(() => {
+          // Structured error already logged in handleFirestoreError
+        })
+        .finally(() => {
+          autoDistRunningRef.current = false;
+        });
+    };
+
+    tryRunSchedule();
+    const timer = window.setInterval(tryRunSchedule, 20000);
+    return () => window.clearInterval(timer);
+  }, [authReady, user, isAdmin, adminSettings, members, group, dailyStats, monthlyStats, integration]);
+
+  // 24-Hour Continuous Random Drip (1-3 members x 20-50 msgs per interval, >=15k/day pace + catch-up)
+  useEffect(() => {
+    if (!authReady || !user || !isAdmin) return;
+    if (!adminSettings?.dripEnabled || members.length === 0) return;
+
+    const tryRunDrip = () => {
+      if (dripRunningRef.current) return;
+      dripRunningRef.current = true;
+      void runDripTick({
+        currentGroup: group,
+        members,
+        dailyStats,
+        monthlyStats,
+        integrationProcessedCount: integration?.eventsProcessedCount ?? 0,
+        adminSettings,
+      })
+        .catch(() => {
+          // Structured error already logged in handleFirestoreError
+        })
+        .finally(() => {
+          dripRunningRef.current = false;
+        });
+    };
+
+    tryRunDrip();
+    const timer = window.setInterval(tryRunDrip, 30000);
+    return () => window.clearInterval(timer);
+  }, [authReady, user, isAdmin, adminSettings, members, group, dailyStats, monthlyStats, integration]);
 
   const creationDate = group?.creationDate || adminSettings?.groupCreationDate || getDhakaDateKey();
 
